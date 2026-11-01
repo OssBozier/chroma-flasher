@@ -22,10 +22,10 @@ what is happening, so your eyes and hands can stay on the tag:
 A status board in the terminal shows each step, and every run is logged per serial
 (`<SERIAL>_flash.log`).
 
-**Bench guide:** [`docs/flashing-guide.html`](docs/flashing-guide.html) walks through one tag from
+**Bench guide:** [read it online](https://ossbozier.github.io/chroma-flasher/docs/flashing-guide.html)
+(source: [`docs/flashing-guide.html`](docs/flashing-guide.html)). It walks through one tag from
 start to finish: the debugger socket and its pin 1, the power Y-lead, which wire colour goes on which
-pad (with a photo of the rev B pads), opening the case, flashing, and troubleshooting. Download it
-and open it in a browser.
+pad (with a photo of the rev B pads), opening the case, flashing, and troubleshooting.
 
 **Once the tags run OpenEPaperLink**, [oepl-pc-ap](https://github.com/OssBozier/oepl-pc-ap) is a
 small access point that runs on a PC with a CC1101 radio module, if you don't have an OEPL AP.
