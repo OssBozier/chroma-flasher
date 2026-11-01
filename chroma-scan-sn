@@ -1,0 +1,201 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.9,<3.13"
+# dependencies = ["zxing-cpp", "pillow", "numpy", "rapidocr-onnxruntime"]
+# ///
+"""Read a Chroma tag serial (e.g. JF10012345B) from its label with the PC's camera.
+
+    chroma-scan-sn [SECONDS]      prints the serial and exits 0, or exits 1 after SECONDS (default 30)
+
+Frames are piped from ffmpeg and decoded in memory; none are saved. Under WSL it uses the Windows
+ffmpeg.exe with DirectShow (WSL can't see the cameras), on Linux v4l2 and on macOS AVFoundation.
+Each frame is tried as a barcode first, then the printed serial in the yellow box is read as
+text (OCR). At webcam sharpness the printed characters survive where the thin bars don't: in
+real laptop-camera shots, 0 of 20 barcodes decoded but 5 of 20 OCR reads were right (and 1 wrong),
+so an OCR serial only counts after VOTES (default 3) reads agree and it has at least twice the
+reads of any other candidate.
+A live preview window (mirrored, with a yellow box to aim the label at) shows on screen
+while it scans; it is never saved. PREVIEW=0 turns it off.
+Settings come from the environment, or the KEY=VALUE config file chroma-flash uses:
+  CAM       the camera: a DirectShow name under WSL (default the first one), a /dev/video device on
+            Linux (default /dev/video0), an AVFoundation index on macOS (default 0). A webcam that
+            can't focus at 10 cm is too blurry; a laptop's built-in camera usually does better.
+  CAM_SIZE  the mode to ask the camera for, WxH (default 1920x1080). The label's barcode is only
+            about 3 cm wide, so use the camera's largest mode.
+  FFMPEG    the ffmpeg to run (default ffmpeg.exe on the Windows PATH under WSL, else ffmpeg)
+  FFMPEG_INPUT replaces the ffmpeg input options, e.g. FFMPEG_INPUT="-loop 1 -i label.jpg" PREVIEW=0
+            to test without a camera.
+"""
+
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import threading
+import time
+
+import numpy as np
+import zxingcpp
+from PIL import Image
+from rapidocr_onnxruntime import RapidOCR
+
+CONFIG = os.environ.get("CHROMA_FLASH_CONFIG") or os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "chroma-flash", "config")
+SERIAL = re.compile(r"^[A-Z]{2}[0-9]{8}[BC]$")
+# OCR look-alikes, fixed by position: 2 letters, 8 digits, then B or C. In the real shots the
+# final B came out as 8, # or 0; 0 is left out because it is as likely to be a misread C
+TO_LETTER = str.maketrans("01258", "OIZSB")
+TO_DIGIT = str.maketrans("OQDILZSB", "00011258")
+TO_SUFFIX = str.maketrans("8#", "BB")
+
+
+def serial_from_text(text):
+    t = re.sub(r"[\s.]", "", text.upper())
+    if len(t) != 11 or not t[:10].isalnum():
+        return None  # whole tokens only, so FCC/IC numbers can't be mistaken for a serial
+    t = t[:2].translate(TO_LETTER) + t[2:10].translate(TO_DIGIT) + t[10].translate(TO_SUFFIX)
+    return t if SERIAL.match(t) else None
+
+
+def ocr_serials(ocr, img):
+    for angle in (0, 90, 270):  # the tag may be held level or on either side
+        res, _ = ocr(np.array(img.rotate(angle, expand=True).convert("RGB")))
+        found = {sn for _, text, _ in (res or []) if (sn := serial_from_text(text))}
+        if found:
+            return found
+    return set()
+
+
+def barcode_serial(img, box):
+    found = [*zxingcpp.read_barcodes(img, formats=zxingcpp.BarcodeFormat.Code128),
+             *zxingcpp.read_barcodes(box, formats=zxingcpp.BarcodeFormat.Code128)]
+    if not found:  # second chance for a soft or unevenly lit label
+        found = zxingcpp.read_barcodes(box, formats=zxingcpp.BarcodeFormat.Code128,
+                                       binarizer=zxingcpp.Binarizer.GlobalHistogram)
+    for r in found:
+        text = r.text.strip().upper()
+        if SERIAL.match(text):
+            return text
+    return None
+
+
+def load_config():
+    """KEY=VALUE lines, as chroma-flash reads them; the environment wins over the file."""
+    try:
+        lines = open(CONFIG).read().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        m = re.match(r"^([A-Z_][A-Z0-9_]*)=(.*)$", line.strip())
+        if m and m[1] not in os.environ:
+            os.environ[m[1]] = os.path.expanduser(m[2].strip('"'))
+
+
+def is_wsl():
+    try:
+        return "microsoft" in open("/proc/version").read().lower()
+    except OSError:
+        return False
+
+
+def first_dshow_camera(ffmpeg):
+    out = subprocess.run([ffmpeg, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
+                         capture_output=True, text=True).stderr
+    m = re.search(r'"([^"]+)" \(video\)', out)
+    return m[1] if m else None
+
+
+def camera_input(ffmpeg, W, H):
+    if "FFMPEG_INPUT" in os.environ:
+        return shlex.split(os.environ["FFMPEG_INPUT"])
+    cam = os.environ.get("CAM")
+    size = ["-video_size", f"{W}x{H}"]
+    if ffmpeg.lower().endswith(".exe"):
+        cam = cam or first_dshow_camera(ffmpeg)
+        if not cam:
+            sys.exit("No camera found (ffmpeg -list_devices true -f dshow -i dummy lists none)")
+        return ["-f", "dshow", *size, "-i", f"video={cam}"]
+    if sys.platform == "darwin":
+        return ["-f", "avfoundation", "-framerate", "30", *size, "-i", cam or "0"]
+    return ["-f", "v4l2", *size, "-i", cam or "/dev/video0"]
+
+
+def main():
+    load_config()
+    limit = float(sys.argv[1]) if len(sys.argv) > 1 else 30
+    votes_needed = int(os.environ.get("VOTES", "3"))
+    W, H = (int(v) for v in os.environ.get("CAM_SIZE", "1920x1080").lower().split("x"))
+    ffmpeg = os.environ.get("FFMPEG") or (is_wsl() and shutil.which("ffmpeg.exe")) or "ffmpeg"
+    source = camera_input(ffmpeg, W, H)
+    scan = f"fps=4,scale={W}:{H},format=gray"
+    if os.environ.get("PREVIEW", "1") == "0":
+        cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", *source,
+               "-vf", scan, "-f", "rawvideo", "-"]
+    else:
+        # Mirrored like a selfie view so moving the label feels natural; decoding uses the unflipped frames
+        view = ("scale=960:540,hflip,drawbox=x=iw*0.3:y=ih*0.3:w=iw*0.4:h=ih*0.4:color=yellow:t=4,"
+                "format=yuv420p")
+        cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", *source,
+               "-filter_complex", f"[0:v]split=2[a][b];[a]{scan}[scan];[b]{view}[view]",
+               "-map", "[scan]", "-f", "rawvideo", "-",
+               "-map", "[view]", "-f", "sdl", "Label camera - hold the label in the yellow box"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)  # ffmpeg errors show in the window
+
+    # OCR takes about a second a frame, slower than the camera, so a reader thread keeps only the
+    # newest frame; otherwise the pipe fills and ffmpeg (and with it the preview) stalls
+    latest = {"frame": None, "n": 0, "eof": False}
+    cond = threading.Condition()
+
+    def reader():
+        while True:
+            frame = proc.stdout.read(W * H)
+            with cond:
+                if len(frame) < W * H:
+                    latest["eof"] = True  # camera missing or in use
+                else:
+                    latest["frame"], latest["n"] = frame, latest["n"] + 1
+                cond.notify()
+            if latest["eof"]:
+                return
+
+    threading.Thread(target=reader, daemon=True).start()
+    ocr = RapidOCR()
+    votes = {}
+    deadline, last_n = None, 0
+    try:
+        while deadline is None or time.monotonic() < deadline:
+            with cond:
+                cond.wait_for(lambda: latest["n"] > last_n or latest["eof"], timeout=1)
+                if latest["n"] == last_n:
+                    if latest["eof"]:
+                        break
+                    continue
+                frame, last_n = latest["frame"], latest["n"]
+            if deadline is None:
+                # The camera and the preview window take several seconds to open, so the time
+                # allowed for scanning starts from the first frame, not from launch
+                deadline = time.monotonic() + limit
+                print("Camera ready: hold the label in the yellow box", file=sys.stderr, flush=True)
+            img = Image.frombytes("L", (W, H), frame)
+            box = img.crop((int(W * 0.3), int(H * 0.3), int(W * 0.7), int(H * 0.7)))
+            big = box.resize((box.width * 2, box.height * 2), Image.LANCZOS)
+            sn = barcode_serial(img, big)
+            if sn:
+                print(sn)  # a barcode decode is checksummed, so one is enough
+                return 0
+            for sn in ocr_serials(ocr, big):
+                votes[sn] = votes.get(sn, 0) + 1
+                rivals = max([v for s, v in votes.items() if s != sn], default=0)
+                print(f"Read {sn} ({votes[sn]} of {votes_needed})", file=sys.stderr, flush=True)
+                if votes[sn] >= votes_needed and votes[sn] >= 2 * rivals:
+                    print(sn)
+                    return 0
+    finally:
+        proc.kill()
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

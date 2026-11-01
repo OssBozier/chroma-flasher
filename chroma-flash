@@ -1,0 +1,755 @@
+#!/usr/bin/env bash
+# chroma-flash: hands-free OpenEPaperLink flashing for Chroma 29 tags (CC1110) with a TI CC Debugger.
+# It shows a live status board and speaks each step, so the operator can keep both hands on the probes:
+#   0. read the serial from the tag's label (camera, or typed)   3. erase, write and verify
+#   1. wait for the chip (no need to press the debugger's Reset)  4. restart the tag
+#   2. back up the stock firmware                                 5. read the MAC and check the serial
+# If the firmware couldn't read the factory serial (MAC 4467090000000000), the label's serial is patched
+# into a copy of the image and flashed again. Run with --help for the options; see README.md.
+
+VERSION=0.1.0
+# Find the sibling scripts, and cc-tool and uv in ~/.local/bin even from a shell that hasn't set PATH up
+# (after PATH, so a cc-tool earlier on PATH, such as a test stand-in, still wins)
+PATH="$(dirname "$(readlink -f "$0")"):$PATH:$HOME/.local/bin"
+
+usage() {
+	cat <<EOF
+Usage: chroma-flash [OPTIONS] [SERIAL]
+
+Flash OpenEPaperLink onto a Chroma 29 tag through a TI CC Debugger, hands-free.
+SERIAL is the tag's label serial, e.g. JA10012345B (2 letters, 8 digits, B or C).
+Given one, the label isn't scanned; without one, the label is read by camera or typed.
+
+Serial:
+  -s, --serial SN        the tag's serial (same as the SERIAL argument)
+      --no-scan          don't ask for the label's serial; a missing serial is then asked for after the flash
+      --no-camera        type the serial instead of reading it with the camera
+      --no-check         skip reading the MAC after the flash (no serial check or fix)
+      --mac-addr HEX     XDATA address of mSelfMac (default: found in the image, else searched for
+                         in RAM; see README)
+
+Firmware:
+  -i, --image FILE       image to flash (default: newest chroma29_full_*.bin in the tag dir,
+                         or chroma29_8151_full_*.bin for serials ending in C)
+      --tag-dir DIR      OpenEPaperLink's binaries/Tag directory
+      --backup           read the stock firmware before erasing (the default)
+      --no-backup        skip it; factory tags are read-locked, so it usually only costs time
+
+Diagnose:
+      --diag             check the tag without changing it: contact quality, lock state, which
+                         firmware is on the chip, and the MAC/serial if OEPL is running
+
+Operation:
+      --tts ENGINE       speech: auto, powershell, spd-say, espeak-ng, espeak, say, none (default auto)
+      --no-tts           same as --tts none
+      --tries N          erase/write/verify attempts (default $FLASH_TRIES)
+      --wait SECONDS     how long to wait for the chip (default $WAIT_LIMIT)
+      --scan-seconds N   how long the camera looks for the label (default $SCAN_SECONDS)
+      --reject-seconds N time to press n after a camera read is spoken (default $REJECT_SECONDS)
+      --camera NAME      camera for the label (see chroma-scan-sn)
+      --data-dir DIR     where logs, backups and patched images go (default $DATA_DIR)
+  -h, --help             show this help
+      --version          show the version
+
+Every option can also be set in $CONFIG
+as KEY=VALUE lines (TAG_DIR, DATA_DIR, IMG, NOBACKUP=1, NOSCAN=1, NOCAMERA=1, NOCHECK=1, TTS,
+PATCHED_DIR, DIAG_IMAGES, WIRE_DD, WIRE_DC, WIRE_RESET, WIRE_VDD, WIRE_GND, CHIP_ANSWERS, FLASH_TRIES, WAIT_LIMIT, CC_TIMEOUT, SCAN_SECONDS, REJECT_SECONDS, MAC_ADDR, CAM, CAM_SIZE, FFMPEG, PREVIEW),
+or in the environment, which wins over the file. Options win over both.
+EOF
+}
+
+# KEY=VALUE lines; a variable already set in the environment is left alone
+load_config() {
+	local key val
+	[ -f "$1" ] || return 0
+	while IFS='=' read -r key val; do
+		[[ $key =~ ^[A-Z_][A-Z0-9_]*$ ]] || continue   # skips comments and blank lines
+		[ -n "${!key+x}" ] && continue
+		val=${val%\"}; val=${val#\"}; val=${val/#\~/$HOME}
+		printf -v "$key" '%s' "$val"
+	done <"$1"
+}
+
+CONFIG=${CHROMA_FLASH_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/chroma-flash/config}
+load_config "$CONFIG"
+
+DATA_DIR=${DATA_DIR:-$HOME/chroma-flash}
+FLASH_TRIES=${FLASH_TRIES:-8}
+WAIT_LIMIT=${WAIT_LIMIT:-600}         # seconds to wait for the chip before giving up
+CC_TIMEOUT=${CC_TIMEOUT:-90}          # seconds before a hung cc-tool is stopped
+CHIP_ANSWERS=${CHIP_ANSWERS:-3}        # good reads in a row before "chip found"
+SCAN_SECONDS=${SCAN_SECONDS:-30}
+REJECT_SECONDS=${REJECT_SECONDS:-10}
+# Where the firmware keeps mSelfMac in RAM. Unless given, it is found in each image (mac_addr_in), and
+# failing that searched for in RAM (mac_in_ram). A read is only trusted when it shows the fixed 44 67
+# top bytes, so a wrong address skips the check instead of misreading it
+MAC_ADDR_GIVEN=${MAC_ADDR:+1}
+TTS=${TTS:-auto}
+# Wire colours, shown on the status board and spoken when it's time to hold the probes
+WIRE_DD=${WIRE_DD:-green}       # TP3
+WIRE_DC=${WIRE_DC:-yellow}      # TP5
+WIRE_RESET=${WIRE_RESET:-blue}  # TP2
+WIRE_VDD=${WIRE_VDD:-red}       # +VBAT (J2, by TP4)
+WIRE_GND=${WIRE_GND:-black}     # battery negative
+POWERSHELL=${POWERSHELL:-${PS:-/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe}}
+
+valid_sn() { [[ ${1^^} =~ ^[A-Z]{2}[0-9]{8}[BC]$ ]]; }
+opt_value() { [ -n "$2" ] || { echo "chroma-flash: $1 needs a value" >&2; exit 2; }; }
+while [ $# -gt 0 ]; do
+	arg=$1
+	case $arg in --*=*) set -- "${arg%%=*}" "${arg#*=}" "${@:2}"; arg=$1 ;; esac
+	case $arg in
+		-s|--serial)      opt_value "$1" "$2"; SN=$2; shift ;;
+		--no-scan)        NOSCAN=1 ;;
+		--no-camera)      NOCAMERA=1 ;;
+		--no-check)       NOCHECK=1 ;;
+		--mac-addr)       opt_value "$1" "$2"; MAC_ADDR=$2; shift ;;
+		-i|--image)       opt_value "$1" "$2"; IMG=$2; shift ;;
+		--tag-dir)        opt_value "$1" "$2"; TAG_DIR=$2; shift ;;
+		--backup)         NOBACKUP= ;;
+		--no-backup)      NOBACKUP=1 ;;
+		--tts)            opt_value "$1" "$2"; TTS=$2; shift ;;
+		--no-tts)         TTS=none ;;
+		--tries)          opt_value "$1" "$2"; FLASH_TRIES=$2; shift ;;
+		--wait)           opt_value "$1" "$2"; WAIT_LIMIT=$2; shift ;;
+		--scan-seconds)   opt_value "$1" "$2"; SCAN_SECONDS=$2; shift ;;
+		--reject-seconds) opt_value "$1" "$2"; REJECT_SECONDS=$2; shift ;;
+		--camera)         opt_value "$1" "$2"; CAM=$2; shift ;;
+		--data-dir)       opt_value "$1" "$2"; DATA_DIR=$2; shift ;;
+		--diag)           DIAG=1 ;;
+		-h|--help)        usage; exit 0 ;;
+		--version)        echo "chroma-flash $VERSION"; exit 0 ;;
+		-*)               echo "chroma-flash: unknown option $1 (see --help)" >&2; exit 2 ;;
+		*)                SN=$1 ;;
+	esac
+	shift
+done
+
+for n in CHIP_ANSWERS FLASH_TRIES WAIT_LIMIT CC_TIMEOUT SCAN_SECONDS REJECT_SECONDS; do
+	[[ ${!n} =~ ^[1-9][0-9]*$ ]] || { echo "chroma-flash: $n must be a whole number above 0" >&2; exit 2; }
+done
+case $TTS in auto|powershell|spd-say|espeak-ng|espeak|say|none) ;;
+	*) echo "chroma-flash: --tts must be auto, powershell, spd-say, espeak-ng, espeak, say or none" >&2; exit 2 ;; esac
+[ -n "$MAC_ADDR" ] && [[ ! $MAC_ADDR =~ ^[0-9A-Fa-f]{1,4}$ ]] && { echo "chroma-flash: --mac-addr must be hex, e.g. F950" >&2; exit 2; }
+MAC_ADDR_GIVEN=${MAC_ADDR:+1}
+command -v cc-tool >/dev/null || { echo "chroma-flash: cc-tool not found on PATH (see README.md)" >&2; exit 1; }
+# chroma-scan-sn reads these, so pass on the ones that came from the config file
+export CAM CAM_SIZE FFMPEG PREVIEW VOTES
+
+# The patched cc-tool (see cc-tool/ in this repo): when the debugger reports no chip (it only probes at
+# power-up or on its Reset button), assume a CC1110 and try the real handshake anyway
+export CC_ASSUME_TARGET=${CC_ASSUME_TARGET:-1110}
+# ...and only believe a chip whose debug status reads the same several times, and isn't all zeros or ones:
+# a floating or half-touching data line once passed as a locked chip
+export CC_CHECK_STATUS=${CC_CHECK_STATUS:-1}
+IMG_GIVEN=${IMG:+1}
+SN=${SN:-tag-$(date +%m%d-%H%M%S)}
+valid_sn "$SN" && SN=${SN^^}
+BK=$DATA_DIR
+PATCHED=${PATCHED_DIR:-$DATA_DIR/patched}
+mkdir -p "$BK" || exit 1
+LOG="$BK/${SN}_flash.log"
+OUT=$(mktemp)
+IS_WSL=; grep -qi microsoft /proc/version 2>/dev/null && IS_WSL=1
+
+STEPS=("Find the chip" "Back up stock firmware" "Erase, write, verify" "Restart the tag" "Check the serial (MAC)")
+STATE=(wait wait wait wait wait)   # wait | run | ok | skip | fail
+TIMES=("" "" "" "" "")
+BANNER="" BANNER_COLOUR=44 DETAIL="" START=$(date +%s)
+
+newest() { ls "$TAG_DIR"/$1 2>/dev/null | sort -V | tail -1; }
+
+# The image for the board rev: serials ending in C have the UC8151 panel controller
+pick_image() {
+	[ -n "$IMG_GIVEN" ] && return
+	case ${SN^^} in
+		*C) IMG=$(newest 'chroma29_8151_full_*.bin') ;;
+		*)  IMG=$(newest 'chroma29_full_*.bin') ;;
+	esac
+}
+
+if [ "$TTS" = auto ]; then
+	if [ -x "$POWERSHELL" ]; then TTS=powershell
+	elif command -v spd-say >/dev/null; then TTS=spd-say
+	elif command -v espeak-ng >/dev/null; then TTS=espeak-ng
+	elif command -v espeak >/dev/null; then TTS=espeak
+	elif [ "$(uname)" = Darwin ]; then TTS=say
+	else TTS=none; fi
+fi
+
+# say TEXT [SOUND]: SOUND is a C:\Windows\Media wav played before the words (PowerShell only), so a
+# step can be told apart by ear
+say() {
+	local chime="" text=${1//\'/\'\'}   # ' doubled for PowerShell's single-quoted string
+	echo "$(date +%T) SAY: $1" >>"$LOG"
+	case $TTS in
+		powershell)
+			[ -n "$2" ] && chime="(New-Object System.Media.SoundPlayer 'C:\\Windows\\Media\\$2').PlaySync(); "
+			"$POWERSHELL" -NoProfile -Command "${chime}Add-Type -AssemblyName System.Speech; \$s=New-Object System.Speech.Synthesis.SpeechSynthesizer; \$s.Rate=1; \$s.Speak('$text')" >/dev/null 2>&1 & ;;
+		spd-say|espeak-ng|espeak) "$TTS" -- "$1" >/dev/null 2>&1 & ;;
+		say) command say "$1" >/dev/null 2>&1 & ;;
+	esac
+}
+
+draw() {
+	local cols i mark colour line
+	cols=$(tput cols 2>/dev/null || echo 80)
+	printf '\033[H\033[2J'
+	printf '\033[1m  CHROMA 29 FLASH\033[0m   tag %s   image %s   elapsed %ss\n\n' "$SN" "$(basename "${IMG:-none}")" $(( $(date +%s) - START ))
+	for i in "${!STEPS[@]}"; do
+		case ${STATE[$i]} in
+			ok)   mark="  OK "; colour=32 ;;
+			run)  mark=" >>> "; colour=33 ;;
+			skip) mark=" skip"; colour=90 ;;
+			fail) mark=" FAIL"; colour=31 ;;
+			*)    mark="     "; colour=90 ;;
+		esac
+		printf '  \033[1;%sm%s\033[0m  %d. %-26s %s\n' "$colour" "$mark" $((i + 1)) "${STEPS[$i]}" "${TIMES[$i]}"
+	done
+	printf '\n  Probes: %s TP3 (DD)   %s TP5 (DC)   %s TP2 (Reset)\n' "$(wire "$WIRE_DD")" "$(wire "$WIRE_DC")" "$(wire "$WIRE_RESET")"
+	printf '  Power:  %s +VBAT (J2 by TP4)   %s GND (battery negative)\n\n' "$(wire "$WIRE_VDD")" "$(wire "$WIRE_GND")"
+	line=$(printf '%*s' "$cols" '')
+	printf '\033[1;97;%sm%s\n%-*s\n%s\033[0m\n\n' "$BANNER_COLOUR" "$line" "$cols" "   $BANNER" "$line"
+	[ -n "$DETAIL" ] && printf '  %s\n' "$DETAIL"
+}
+
+# A wire's colour name, printed in that colour when it is one the terminal has
+wire() {
+	local c
+	case ${1,,} in
+		black) c=90 ;; red) c=31 ;; green) c=32 ;; yellow) c=33 ;; blue) c=34 ;;
+		purple|magenta) c=35 ;; cyan) c=36 ;; white|grey|gray) c=37 ;; *) printf '%s' "$1"; return ;;
+	esac
+	printf '\033[1;%sm%s\033[0m' "$c" "$1"
+}
+PROBES_SAY="$WIRE_DD on T P 3, $WIRE_DC on T P 5, $WIRE_RESET on T P 2."
+
+banner() { BANNER=$1; BANNER_COLOUR=$2; draw; }
+
+# Run cc-tool in the background, redrawing with its latest progress text until it exits. A probe that
+# slips mid-transfer can leave cc-tool waiting on the debugger for good, so it is stopped after
+# CC_TIMEOUT seconds (a full erase, write and verify takes about 20) and counts as a lost contact.
+run_cc() {
+	local t0
+	: >"$OUT"
+	echo "$(date +%T) RUN: cc-tool $*" >>"$LOG"
+	cc-tool "$@" >"$OUT" 2>&1 &
+	local pid=$!
+	t0=$(date +%s)
+	while kill -0 $pid 2>/dev/null; do
+		DETAIL="cc-tool: $(tr '\r' '\n' <"$OUT" | grep -v '^\s*$' | tail -1)"
+		draw
+		if (( $(date +%s) - t0 > CC_TIMEOUT )); then
+			kill $pid 2>/dev/null
+			echo "  cc-tool stopped after ${CC_TIMEOUT}s: no answer from the debugger (Unable to communicate)" >>"$OUT"
+		fi
+		sleep 0.4
+	done
+	wait $pid
+	local rc=$?
+	cat "$OUT" >>"$LOG"
+	echo "$(date +%T) EXIT: $rc" >>"$LOG"
+	DETAIL="cc-tool: $(tr '\r' '\n' <"$OUT" | grep -v '^\s*$' | tail -1)"
+	return $rc
+}
+
+# One poll: a real read that a floating data line can't fake. cc-tool (CC_CHECK_STATUS) first insists on a
+# steady debug status; then a CC1110's PARTNUM register (XDATA DF36) must read 01, or a debug-locked chip
+# refuses the read and says so instead. (A bare handshake once passed with the probes off.)
+chip_answers() {
+	cc-tool --read-xdata DF36:2 >"$OUT" 2>&1
+	grep -q "Unable to communicate" "$OUT" && return 1
+	grep -q "Target is locked" "$OUT" && return 0
+	grep -q "XDATA 01 " "$OUT"
+}
+
+# What the chip said, for the log: its debug status and the PARTNUM read or the lock
+chip_said() { grep -oE 'Debug status: [0-9A-F]+|XDATA.*|Target is locked' "$OUT" | paste -sd ' ' -; }
+
+# Poll until the chip answers CHIP_ANSWERS times in a row, so a passing touch or a noisy lead can't start
+# a write. CC_ASSUME_TARGET makes every poll a real handshake attempt, so the debugger's Reset button isn't
+# needed; pressing it makes the debugger re-enumerate on USB (which, under WSL, means cc-attach again),
+# so never press it mid-command.
+wait_for_chip() {
+	local t0 tries=0 run=0
+	t0=$(date +%s)
+	banner "HOLD THE PROBES ON TP3 (DD), TP5 (DC) AND TP2 (RESET).  NO NEED TO PRESS RESET" 44
+	while :; do
+		tries=$((tries + 1))
+		if chip_answers; then
+			run=$((run + 1))
+			if (( run >= CHIP_ANSWERS )); then
+				echo "$(date +%T) CHIP: answered $run times in a row ($(chip_said))" >>"$LOG"
+				return 0
+			fi
+			DETAIL="Chip answered ($run of $CHIP_ANSWERS in a row). Hold still..."; draw
+			continue
+		fi
+		(( run )) && echo "$(date +%T) CHIP: answered $run time(s), then not ($(chip_said); $(tr '\r' '\n' <"$OUT" | grep -v '^\s*$' | tail -1 | sed 's/^ *//'))" >>"$LOG"
+		run=0
+		if grep -qE "device not found|Access denied" "$OUT"; then
+			if [ -n "$IS_WSL" ] && command -v cc-attach >/dev/null; then
+				DETAIL="Debugger not attached: running cc-attach"; draw
+				cc-attach >>"$LOG" 2>&1
+			else
+				DETAIL="Can't open the debugger: is it plugged in, and does the udev rule allow it? (see README)"
+			fi
+		else
+			DETAIL="Looking for the chip... attempt $tries ($(tr '\r' '\n' <"$OUT" | grep -v '^\s*$' | tail -1 | sed 's/^ *//'))"
+		fi
+		draw
+		if (( $(date +%s) - t0 > WAIT_LIMIT )); then
+			return 1
+		fi
+		sleep 0.5
+	done
+}
+
+finish() {
+	rm -f "$OUT"
+	echo "$(date +%T) END: $1" >>"$LOG"
+	DETAIL="Log: $LOG"
+	draw
+	exit "$2"
+}
+
+# Camera read of the label, spoken back with REJECT_SECONDS to press n. Prints the serial if accepted.
+camera_serial() {
+	local a k
+	[ -n "$NOCAMERA" ] && return 1
+	command -v chroma-scan-sn >/dev/null || return 1
+	DETAIL="Scanning for $SCAN_SECONDS seconds once the camera is ready..."; draw >&2
+	a=$(chroma-scan-sn "$SCAN_SECONDS" 2> >(tee -a "$LOG" >&2)) || return 1
+	echo "$(date +%T) SCANNED: $a" >>"$LOG"
+	banner "CAMERA READ  $a   -  press n within $REJECT_SECONDS seconds if that's wrong" 43 >&2
+	say "I read $(sed 's/./& /g' <<<"$a"). Press N if that is wrong." chimes.wav
+	read -rsn1 -t $((REJECT_SECONDS + 2)) k   # the extra 2 s cover the spoken serial
+	[ "${k,,}" = n ] && return 1
+	echo "$a"
+}
+
+# 0. Read the label before the probes go on: camera first, then typed twice, Enter to skip.
+# A new serial renames the log and, unless an image was given, picks the image for its board rev.
+read_label() {
+	local a c
+	if [ -z "$NOCAMERA" ]; then
+		banner "BEFORE THE PROBES: HOLD THE TAG'S BARCODE LABEL UP TO THE CAMERA" 44
+		say "Before the probes, hold the barcode label up to the camera."
+	fi
+	if ! a=$(camera_serial); then
+		banner "TYPE THE SERIAL FROM THE LABEL TWICE, OR PRESS ENTER TO SKIP" 44
+		say "Type the serial from the label, or press Enter to skip."
+		while :; do
+			read -rp "  Serial (e.g. JF10012345B), Enter to skip: " a
+			[ -z "$a" ] && break
+			read -rp "  Again to confirm:                          " c
+			[ "${a^^}" = "${c^^}" ] && valid_sn "$a" && break
+			echo "  They don't match, or aren't 2 letters + 8 digits + B or C. Try again."
+		done
+	fi
+	[ -z "$a" ] && { echo "$(date +%T) LABEL: skipped" >>"$LOG"; return; }
+	SN=${a^^}
+	echo "$(date +%T) LABEL: $SN" >>"$LOG"
+	cat "$LOG" >>"$BK/${SN}_flash.log" && rm -f "$LOG"
+	LOG="$BK/${SN}_flash.log"
+}
+
+# mSelfMac's address in an OEPL Chroma image. The firmware builds the MAC's fixed top bytes with
+#   mov dptr,#mSelfMac+7 / mov a,#0x44 / movx @dptr,a   and the same for mSelfMac+6 and 0x67,
+# which appears exactly once in every Chroma build so far (F950 in chroma29, F956 in chroma42, ...).
+# Prints the address in hex, or nothing if the pattern isn't there exactly once.
+mac_addr_in() {
+	python3 - "$1" <<'PYEOF'
+import re, sys
+b = open(sys.argv[1], 'rb').read()
+def stores(value):
+    return {b[m.start() + 1] << 8 | b[m.start() + 2]
+            for m in re.finditer(rb'\x90..\x74' + bytes([value]) + rb'\xf0', b, re.S)}
+top, next_ = stores(0x44), stores(0x67)
+if len(top) == 1 and len(next_) == 1 and next(iter(next_)) == next(iter(top)) - 1:
+    print('%04X' % (next(iter(top)) - 7))
+PYEOF
+}
+
+# Use the image's mSelfMac address unless --mac-addr gave one
+mac_addr_for() {
+	[ -n "$MAC_ADDR_GIVEN" ] && return
+	MAC_ADDR=$(mac_addr_in "$1")
+	echo "$(date +%T) MAC ADDRESS: ${MAC_ADDR:-not found} in $(basename "$1")" >>"$LOG"
+}
+
+# Fallback: look through RAM for 8 bytes that can only be an OEPL MAC: 44 67 on top, two letters
+# (0-25, the first maybe with the 8151 builds' 0x20 flag), then eight BCD digits. Sets MAC_ADDR if
+# exactly one is found, or one matching the label's serial.
+mac_in_ram() {
+	local found
+	run_cc --read-xdata F000:0F00 && grep -q "XDATA" "$OUT" || return 1
+	found=$(grep XDATA "$OUT" | sed 's/.*XDATA //' | python3 -c '
+import sys
+b = bytes.fromhex(sys.stdin.read())
+sn = sys.argv[1].upper()
+hits = []
+for i in range(len(b) - 7):
+    m = b[i:i + 8]
+    if m[7] == 0x44 and m[6] == 0x67 and (m[5] & 0x1f) < 26 and m[4] < 26 \
+            and all(x >> 4 <= 9 and x & 15 <= 9 for x in m[:4]):
+        digits = "".join("%02X" % x for x in reversed(m[:4]))
+        hits.append((i, digits))
+want = [h for h in hits if len(sn) >= 10 and h[1] == sn[2:10]]
+pick = want or (hits if len(hits) == 1 else [])
+if pick:
+    print("%04X" % (0xF000 + pick[0][0]))
+' "$SN")
+	[ -n "$found" ] || return 1
+	MAC_ADDR=$found
+	echo "$(date +%T) MAC ADDRESS: $MAC_ADDR, found by searching RAM" >>"$LOG"
+}
+
+# 5. Read mSelfMac from RAM once the firmware has loaded the serial (RAM survives the debugger's reset,
+# and the tag stays powered). Sets MAC, TAG_SN and TAG_DIGITS. Returns 1 if the debugger can't read
+# it, 3 if no MAC is where the image keeps it nor anywhere else in RAM (see --mac-addr).
+read_mac() {
+	local i b searched=
+	for i in $(seq 1 15); do
+		# No address, or no MAC at it: unless --mac-addr gave it, look through RAM (once it reads)
+		if [ -z "$MAC_ADDR" ] || [ "$searched" = wanted ]; then
+			if mac_in_ram; then searched=done
+			elif grep -q "XDATA" "$OUT"; then return 3
+			else DETAIL="Reading the MAC... attempt $i (re-seat the probes if this repeats)"; draw; sleep 1; continue; fi
+		fi
+		if run_cc --read-xdata "$MAC_ADDR:8" && grep -q "XDATA" "$OUT"; then
+			read -ra b <<<"$(grep XDATA "$OUT" | sed 's/.*XDATA //')"
+			if [ "${b[7]^^}${b[6]^^}" != 4467 ]; then
+				[ -n "$MAC_ADDR_GIVEN" ] || [ "$searched" = done ] && return 3
+				searched=wanted
+				continue
+			fi
+			MAC="${b[7]}${b[6]}${b[5]}${b[4]}${b[3]}${b[2]}${b[1]}${b[0]}"; MAC=${MAC^^}
+			TAG_DIGITS="${b[3]}${b[2]}${b[1]}${b[0]}"
+			TAG_SN=$(printf "\\x$(printf %x $((65 + (0x${b[5]} & 0x1f))))\\x$(printf %x $((65 + 0x${b[4]})))")$TAG_DIGITS
+			return 0
+		fi
+		grep -q "unrecognised option\|unknown option" "$OUT" && return 1   # stock cc-tool, without --read-xdata
+		DETAIL="Reading the MAC... attempt $i (re-seat the probes if this repeats)"; draw
+		sleep 1
+	done
+	return 1
+}
+
+# --diag: read-only checks while the probes are held, then a report. Nothing on the tag is changed.
+DIAG_READS=20
+diag() {
+	local i out good=0 lost=0 junk=0 ref="" locked=0 fw="" flash
+	STEPS=("Find the chip" "Contact test ($DIAG_READS reads)" "Lock state" "Firmware on the chip" "MAC and serial")
+	echo "=== $(date) chroma-flash $VERSION --diag" >>"$LOG"
+	STATE[0]=run
+	say "Diagnosis. Hold the probes on the pads: $PROBES_SAY"
+	t=$(date +%s)
+	wait_for_chip || { STATE[0]=fail; banner "NO CHIP FOUND. YOU CAN LET GO." 41; say "No chip found."; finish "timeout" 1; }
+	STATE[0]=ok; TIMES[0]="$(( $(date +%s) - t ))s"
+	say "Chip found. Hold still for about twenty seconds." chimes.wav
+
+	# Lock state: a locked chip refuses memory reads, so it also decides how contact is tested
+	STATE[2]=run; banner "HOLD STILL. CHECKING THE LOCK" 43
+	run_cc --read-xdata DF36:2
+	if grep -q "Unable to communicate" "$OUT"; then STATE[2]=skip; TIMES[2]="no answer"
+	elif grep -q "Target is locked" "$OUT"; then locked=1; STATE[2]=ok; TIMES[2]="locked (factory firmware, or locked by its maker)"
+	elif grep -q "XDATA" "$OUT"; then STATE[2]=ok; TIMES[2]="unlocked"
+	else STATE[2]=skip; TIMES[2]="couldn't tell: $(tr '\r' '\n' <"$OUT" | grep -v '^\s*$' | tail -1 | sed 's/^ *//')"; fi
+
+	# Contact: the same read again and again. A read that fails, or comes back different or all
+	# ones (DD floating), is the kind of glitch that stalls a write
+	STATE[1]=run
+	for i in $(seq 1 $DIAG_READS); do
+		banner "HOLD STILL. CONTACT TEST, READ $i OF $DIAG_READS" 43
+		chip_answers; rc=$?
+		cat "$OUT" >>"$LOG"
+		out=$(chip_said)
+		if grep -q "Unable to communicate" "$OUT" || [ -z "$out" ]; then lost=$((lost + 1))
+		elif (( rc )) || { [ -n "$ref" ] && [ "$out" != "$ref" ]; }; then junk=$((junk + 1))
+		else ref=$out; good=$((good + 1)); fi
+	done
+	TIMES[1]="$good good, $lost no answer, $junk wrong data"
+	if (( lost + junk == 0 )); then STATE[1]=ok; else STATE[1]=fail; fi
+
+	# Firmware: read the flash and compare it with the images we know
+	STATE[3]=run
+	if (( locked )); then
+		STATE[3]=skip; TIMES[3]="can't read a locked chip"
+	else
+		banner "HOLD STILL. READING THE FLASH (about 10 seconds)" 43
+		flash=$(mktemp --suffix=.bin)
+		if run_cc -r "$flash" && [ -s "$flash" ]; then
+			mac_addr_for "$flash"
+			fw=$(python3 - "$flash" "$TAG_DIR" "$PATCHED" "$(dirname "${IMG:-.}")" $DIAG_IMAGES <<'PYEOF'
+import glob, os, sys
+flash = open(sys.argv[1], 'rb').read()
+cands = set()
+for d in sys.argv[2:]:
+    cands.update(glob.glob(os.path.join(d, '*.bin')) if os.path.isdir(d) else glob.glob(d))
+if flash.count(0xff) == len(flash):
+    print('blank (erased)'); sys.exit()
+best = None
+for c in sorted(cands):
+    img = open(c, 'rb').read()
+    if not img or len(img) > len(flash):
+        continue
+    same = sum(a == b for a, b in zip(img, flash))
+    # a write that stopped early: the start matches, the rest is still erased
+    n = 0
+    while n < len(img) and img[n] == flash[n]:
+        n += 1
+    partial = n < len(img) and flash[n:len(img)].count(0xff) == len(img) - n
+    score = (same / len(img), -len(img))
+    if best is None or score > best[0]:
+        best = (score, c, same, len(img), n, partial)
+if not best:
+    print('unknown (no images to compare with)'); sys.exit()
+(_, c, same, size, n, partial) = best
+name = os.path.basename(c)
+if same == size:
+    print(name)
+elif partial:
+    print(f'half-written {name}: first {n * 100 // size}% written, the rest erased')
+elif size - same <= 8:
+    print(f'{name} with {size - same} bytes different (a patched serial?)')
+elif same / size > 0.5:
+    print(f'closest to {name} ({same * 100 // size}% the same)')
+else:
+    print('unknown firmware (stock, or an image not in TAG_DIR/PATCHED_DIR/DIAG_IMAGES)')
+PYEOF
+)
+			STATE[3]=ok; TIMES[3]=$fw
+		else
+			STATE[3]=fail; TIMES[3]="the read failed"
+		fi
+		rm -f "$flash"
+	fi
+
+	# MAC: mSelfMac in RAM, set only while OEPL runs (RAM keeps it through the debugger's reset)
+	STATE[4]=run; banner "HOLD STILL. READING THE MAC" 43
+	if (( locked )); then
+		STATE[4]=skip; TIMES[4]="can't read a locked chip"
+	else
+		read_mac; rc=$?
+		if (( rc == 0 )); then STATE[4]=ok; TIMES[4]="MAC $MAC, serial $TAG_SN (if OEPL has run since power-up)"
+		else STATE[4]=skip; TIMES[4]="no OEPL MAC in RAM (OEPL not running?)"; fi
+		run_cc --reset >/dev/null
+	fi
+	for i in "${!STEPS[@]}"; do echo "$(date +%T) DIAG: ${STEPS[$i]}: ${STATE[$i]} ${TIMES[$i]}" >>"$LOG"; done
+
+	if (( lost + junk == 0 )); then
+		banner "DIAGNOSIS DONE. YOU CAN LET GO.  CONTACT GOOD ($good OF $DIAG_READS)" 42
+		say "Done. You can let go. Contact was good on all $DIAG_READS reads." tada.wav
+	else
+		banner "DIAGNOSIS DONE. YOU CAN LET GO.  CONTACT FLAKY: $((lost + junk)) OF $DIAG_READS READS FAILED" 41
+		say "Done. You can let go. Contact was flaky: $((lost + junk)) of $DIAG_READS reads failed." chord.wav
+	fi
+	finish "diag done" 0
+}
+
+[ -n "$DIAG" ] && diag
+if ! valid_sn "$SN" && [ -z "$NOSCAN" ]; then read_label; fi
+pick_image
+echo "=== $(date) chroma-flash $VERSION SN=$SN IMG=$IMG" >>"$LOG"
+if [ ! -f "$IMG" ]; then
+	banner "NO IMAGE FOUND. GIVE --image FILE OR --tag-dir (OpenEPaperLink's binaries/Tag)" 41
+	finish "no image" 1
+fi
+
+# 1. Find the chip
+STATE[0]=run
+say "Ready. Hold the probes on the pads: $PROBES_SAY"
+t=$(date +%s)
+if ! wait_for_chip; then
+	STATE[0]=fail; banner "NO CHIP FOUND AFTER $((WAIT_LIMIT / 60)) MINUTES. YOU CAN LET GO." 41
+	say "No chip found. You can let go."
+	finish "timeout" 1
+fi
+STATE[0]=ok; TIMES[0]="$(( $(date +%s) - t ))s"
+# Said together with the next step's line, so there is one announcement, not two overlapping ones
+FOUND="Chip found."
+banner "CHIP FOUND. HOLD STILL." 42
+sleep 1
+
+# 2. Back up the stock firmware (two tries, then carry on: a locked chip can't be read)
+STATE[1]=run; t=$(date +%s)
+banner "HOLD STILL. BACKING UP STOCK FIRMWARE" 43
+[ -z "$NOBACKUP" ] && { say "$FOUND Backing up. Hold still." chimes.wav; FOUND=""; }
+backed_up=0
+[ -n "$NOBACKUP" ] && STATE[1]=skip
+for try in 1 2; do
+	[ -n "$NOBACKUP" ] && break
+	if run_cc -r "$BK/${SN}_stock.hex" && ! grep -q "Failed" "$OUT" && [ -s "$BK/${SN}_stock.hex" ]; then
+		backed_up=1; break
+	fi
+	grep -qE "No target detected|Unable to communicate" "$OUT" || break   # failed with the chip present: treat as locked
+	say "Lost contact. Hold the pins again."
+	banner "LOST CONTACT. RE-SEAT THE PROBES. RETRYING IN 4 SECONDS" 41
+	sleep 4
+	wait_for_chip || break
+done
+TIMES[1]="$(( $(date +%s) - t ))s"
+if (( backed_up )); then STATE[1]=ok
+elif [ -n "$NOBACKUP" ]; then TIMES[1]="skipped (--no-backup)"
+else STATE[1]=skip; TIMES[1]+="  (no backup: locked or no contact)"; fi
+
+# 3. Erase, write, verify (retries after a lost contact)
+flash_image() {
+	local try
+	STATE[2]=run; t=$(date +%s)
+	if [ -n "$FOUND" ]; then say "$FOUND Writing. Hold still." chimes.wav; FOUND=""
+	else say "Writing. Hold still."; fi
+	for try in $(seq 1 $FLASH_TRIES); do
+		banner "HOLD STILL. WRITING $(basename "$1")  (attempt $try of $FLASH_TRIES)  DO NOT PRESS RESET" 43
+		if run_cc -e -w "$1" -v && grep -q "Verifying" "$OUT" && ! grep -q "Failed" "$OUT"; then
+			STATE[2]=ok; TIMES[2]="$(( $(date +%s) - t ))s"
+			return 0
+		fi
+		(( try == FLASH_TRIES )) && break
+		if grep -q "still locked after erasing" "$OUT"; then
+			# The chip answered, so the probes touch; an erase that doesn't take has pointed at power
+			say "The erase didn't take. Check the power, and hold the pins again."
+			banner "ERASE DIDN'T TAKE (CHIP ANSWERED). CHECK POWER. RETRYING IN 4 SECONDS" 41
+		else
+			say "Lost contact. Hold the pins again."
+			banner "LOST CONTACT. RE-SEAT THE PROBES. RETRYING IN 4 SECONDS" 41
+		fi
+		sleep 4
+		wait_for_chip || break
+		say "Writing again. Hold still."
+	done
+	TIMES[2]="$(( $(date +%s) - t ))s"
+	STATE[2]=fail; banner "FLASH FAILED. YOU CAN LET GO. SEE THE LOG BELOW." 41
+	say "Flash failed. You can let go."
+	finish "flash failed" 1
+}
+
+# 4. Restart the tag
+restart_tag() {
+	STATE[3]=run; t=$(date +%s)
+	banner "VERIFIED. HOLD FOR THE RESTART." 43
+	if run_cc --reset; then STATE[3]=ok; else STATE[3]=skip; fi
+	TIMES[3]="$(( $(date +%s) - t ))s"
+}
+
+# Copy the image with the serial patched into its default NVRAM block, as OEPL's patch_sn.py does (that
+# refuses letters that differ from the image's, e.g. JF in the JA image, so the letters are patched here too)
+patch_serial() {
+	mkdir -p "$PATCHED"
+	local out="$PATCHED/$(basename "${1%.bin}")_$2.bin"
+	python3 - "$1" "$out" "$2" >>"$LOG" 2>&1 <<'EOF' || return 1
+import sys
+src, out, sn = sys.argv[1:]
+b = bytearray(open(src, 'rb').read())
+magic = bytes([0x56, 0x12, 0x09, 0x85, 0x01, 0x08])
+assert b.count(magic) == 1, 'NVRAM block not found once'
+o = b.find(magic) + 6
+b[o:o + 6] = sn[:2].encode() + bytes.fromhex(sn[2:10])
+open(out, 'wb').write(b)
+print('patched', out)
+EOF
+	PATCHED_IMG=$out
+}
+
+# Get the serial from the label after a flash that found it missing: camera first, typed twice if that fails
+ask_serial() {
+	local a c
+	if [ -z "$NOCAMERA" ]; then
+		banner "SERIAL MISSING (MAC $MAC). LET GO AND HOLD THE TAG'S BARCODE LABEL UP TO THE CAMERA" 41
+		say "The serial is missing. You can let go. Hold the barcode label up to the camera." chord.wav
+	fi
+	if a=$(camera_serial); then NEW_SN=$a; return; fi
+	banner "TYPE THE SERIAL FROM THE BARCODE LABEL, TWICE" 41
+	say "Type the serial from the label."
+	while :; do
+		read -rp "  Serial (e.g. JF10012345B): " a; read -rp "  Again to confirm:          " c
+		[ "${a^^}" = "${c^^}" ] && valid_sn "$a" && break
+		echo "  They don't match, or aren't 2 letters + 8 digits + B or C. Try again."
+	done
+	NEW_SN=${a^^}
+}
+
+# Returns 0 for a serial, 1 for a missing one (digits all zero), 2 if the MAC couldn't be read
+check_serial() {
+	local rc
+	STATE[4]=run; t=$(date +%s)
+	banner "KEEP HOLDING. CHECKING THE SERIAL (about 10 seconds)" 43
+	say "Keep holding. Checking the serial."
+	sleep 6   # boot: the firmware loads the serial (and rewrites the factory block if it's missing)
+	read_mac; rc=$?
+	if (( rc == 3 )); then
+		STATE[4]=skip; TIMES[4]="no OEPL MAC in RAM (see --mac-addr)"
+		return 2
+	elif (( rc != 0 )); then
+		STATE[4]=skip; TIMES[4]="couldn't read the MAC"
+		return 2
+	fi
+	run_cc --reset >/dev/null   # restart cleanly after the read
+	TIMES[4]="MAC $MAC ($TAG_SN)"
+	echo "$(date +%T) MAC: $MAC SN: $TAG_SN" >>"$LOG"
+	[ "$TAG_DIGITS" != 00000000 ]
+}
+
+mac_addr_for "$IMG"
+flash_image "$IMG"
+restart_tag
+
+case "$(basename "$IMG")" in
+	*kanban*) WATCH="the first Kanban card" ;;   # demo firmware has no splash screen
+	*_full_*) WATCH="the splash screen" ;;
+	*)        WATCH="the display" ;;
+esac
+
+if [ -n "$NOCHECK" ]; then
+	STATE[4]=skip; TIMES[4]="skipped (--no-check)"
+elif [[ $(basename "$IMG") != *_full_* ]]; then
+	STATE[4]=skip; TIMES[4]="not an OEPL full image"
+else
+	check_serial; rc=$?
+	if (( rc == 1 )); then
+		# Serial missing: patch the one from the label in and flash again
+		STATE[4]=fail
+		if valid_sn "$SN"; then
+			NEW_SN=$SN
+		else
+			ask_serial
+		fi
+		patch_serial "$IMG" "$NEW_SN" || { banner "COULDN'T PATCH THE IMAGE. SEE THE LOG BELOW." 41; finish "patch failed" 1; }
+		say "Patching the serial in. Hold the probes again." chimes.wav
+		STATE=(ok "${STATE[1]}" wait wait wait)
+		wait_for_chip || finish "timeout" 1
+		flash_image "$PATCHED_IMG"
+		restart_tag
+		check_serial; rc=$?
+		if (( rc == 0 )) && [ "${TAG_SN}" = "${NEW_SN:0:10}" ]; then
+			STATE[4]=ok; SN_NOTE="Serial was missing, so it was reprogrammed from the label."
+		elif (( rc != 2 )); then
+			STATE[4]=fail; banner "SERIAL STILL WRONG (MAC $MAC). YOU CAN LET GO. SEE THE LOG BELOW." 41
+			say "The serial is still wrong. You can let go."
+			finish "serial still wrong" 1
+		fi
+	elif (( rc == 0 )); then
+		STATE[4]=ok
+		if valid_sn "$SN" && [ "$TAG_SN" != "${SN:0:10}" ]; then
+			STATE[4]=fail; TIMES[4]+="  DOESN'T MATCH LABEL $SN"
+			echo "$(date +%T) MISMATCH: tag $TAG_SN, label $SN" >>"$LOG"
+			banner "THE TAG'S SERIAL $TAG_SN DOESN'T MATCH THE LABEL $SN. YOU CAN LET GO. SEE THE LOG BELOW." 41
+			say "Warning. The tag's serial doesn't match the label. You can let go."
+			finish "serial mismatch" 1
+		elif valid_sn "$SN"; then
+			SN_NOTE="Serial matches the label. No reprogramming needed."
+		else
+			SN_NOTE="Serial was intact. No reprogramming needed."
+		fi
+	fi
+	[ -n "$SN_NOTE" ] && { TIMES[4]+="  $SN_NOTE"; echo "$(date +%T) SERIAL: $SN_NOTE" >>"$LOG"; }
+fi
+
+banner "DONE. YOU CAN LET GO.  ${SN_NOTE^^}  Watch the display for $WATCH." 42
+if [ -n "$MAC" ] && [ "${STATE[4]}" = ok ]; then
+	say "Done. You can let go. The serial is $(sed 's/./& /g' <<<"$TAG_SN"). $SN_NOTE" tada.wav
+else
+	say "Done. You can let go. Watch for $WATCH." tada.wav
+fi
+finish "done" 0

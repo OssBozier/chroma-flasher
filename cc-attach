@@ -1,0 +1,20 @@
+#!/bin/sh
+# WSL only: attach the CC Debugger to WSL with usbipd-win, open up its USB device node, and check
+# cc-tool sees it. (On plain Linux a udev rule does the permissions instead; see README.md.)
+# The BUSID follows the USB port, so it is looked up by the debugger's VID:PID (0451:16a2) unless given.
+# The bind (admin, once per port, in Windows) is: usbipd bind --busid <BUSID>
+USBIPD=${USBIPD:-$(command -v usbipd.exe || echo "/mnt/c/Program Files/usbipd-win/usbipd.exe")}
+BUSID=${1:-$("$USBIPD" list 2>/dev/null | awk '/0451:16a2/ { print $1; exit }')}
+
+if ! grep -qs 0451 /sys/bus/usb/devices/*/idVendor; then
+	[ -n "$BUSID" ] || { echo "CC Debugger not plugged in (no 0451:16a2 in usbipd list)"; exit 1; }
+	"$USBIPD" attach --wsl --busid "$BUSID" || exit 1
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+		grep -qs 0451 /sys/bus/usb/devices/*/idVendor && break
+		sleep 1
+	done
+fi
+
+# WSL usually runs without udev, so permissions reset on every attach; wsl.exe -u root needs no sudo password
+wsl.exe -d "${WSL_DISTRO_NAME:?not running under WSL}" -u root -- sh -c 'chmod a+rw /dev/bus/usb/*/*'
+cc-tool -t

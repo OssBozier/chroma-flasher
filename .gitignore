@@ -1,0 +1,7 @@
+*_flash.log
+*_stock.hex
+patched/
+*.bin
+panel-refresh/frames/
+panel-refresh/frames.h
+__pycache__/

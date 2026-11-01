@@ -1,0 +1,39 @@
+# chroma-flash and chroma-scan-sn settings: KEY=VALUE, one per line.
+# The environment wins over this file, and command-line options win over both.
+
+# OpenEPaperLink's binaries/Tag folder (the image is picked from here by board rev)
+TAG_DIR=~/OpenEPaperLink/binaries/Tag
+# Logs, firmware backups and serial-patched images
+#DATA_DIR=~/chroma-flash
+#PATCHED_DIR=~/chroma-flash/patched
+
+# 1 turns a step off, as the --no-... options do
+#NOBACKUP=1
+#NOSCAN=1
+#NOCAMERA=1
+#NOCHECK=1
+
+# Speech: auto, powershell, spd-say, espeak-ng, espeak, say or none
+#TTS=auto
+
+#FLASH_TRIES=8
+#WAIT_LIMIT=600
+#SCAN_SECONDS=30
+#REJECT_SECONDS=10
+# Your wire colours, shown on the status board and spoken when it's time to hold the probes
+#WIRE_DD=green
+#WIRE_DC=yellow
+#WIRE_RESET=blue
+#WIRE_VDD=red
+#WIRE_GND=black
+
+# XDATA address of mSelfMac in the image (F950 in chroma29_full_0015)
+#MAC_ADDR=F950
+
+# Camera: a DirectShow name under WSL (default the first camera), /dev/videoN on Linux, an index on macOS
+#CAM=Integrated Camera
+#CAM_SIZE=1920x1080
+# Under WSL, the Windows ffmpeg.exe (default: ffmpeg.exe on the Windows PATH)
+#FFMPEG=/mnt/c/Program Files/ffmpeg/bin/ffmpeg.exe
+# 0 hides the camera preview window
+#PREVIEW=1
