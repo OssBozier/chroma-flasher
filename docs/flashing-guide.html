@@ -420,7 +420,7 @@ mkdir -p "$BK"</pre></div>
 
   <div class="cmd"><div class="who">1 · confirm the chip</div><button class="copy" type="button">Copy</button><pre>cc-tool -t</pre></div>
   <div class="cmd"><div class="who">2 · back up the stock firmware</div><button class="copy" type="button">Copy</button><pre>cc-tool -r "$BK/${SN}_stock.hex"</pre></div>
-  <p>The backup lets you put the tag back to stock if you ever need to. Factory tags are usually read-locked, so this step fails or produces an empty file. That's fine; carry on, because the erase in the next step clears the lock.</p>
+  <p>The backup lets you put the tag back to stock if you ever need to. Factory firmware is normally readable, so this should give you a full 32&nbsp;KB file. If cc-tool says the target is locked, the probes are usually not fully on their pads: re-seat them and try again. If it still fails, carry on; the erase in the next step clears any lock.</p>
   <div class="cmd"><div class="who">3 · erase, write, verify</div><button class="copy" type="button">Copy</button><pre>cc-tool -e -w "$IMG" -v</pre></div>
   <div class="cmd"><div class="who">4 · restart the tag</div><button class="copy" type="button">Copy</button><pre>cc-tool --reset</pre></div>
   <p>Step 3 takes a few seconds and finishes with a verify result. If a wire slips during any step, re-seat it and run that step again. Nothing is lost by retrying.</p>
@@ -451,7 +451,7 @@ cc-tool -e -w "$BK/${SN}_patched.bin" -v &amp;&amp; cc-tool --reset</pre></div>
       <tr><td>LED red, <code>No target detected</code></td><td>The debugger can't see the chip.</td><td>Check the five wires and that pin 1 is really pin 1. Make sure TP4 has power. By hand, press the debugger's Reset button and try again.</td></tr>
       <tr><td>Chip answers once with a random status (<code>0F</code>, <code>1F</code>, <code>03</code>), then not</td><td>Half contact, or the tag is losing power.</td><td>Check the red (VBAT) and black (GND) leads first, then press the DD probe (TP3) firmly.</td></tr>
       <tr><td>LED green, but verify fails</td><td>A data wire is making poor contact.</td><td>Re-seat or re-solder DC and DD, then run step 3 again.</td></tr>
-      <tr><td>Backup fails or the file is empty</td><td>The stock firmware is read-locked.</td><td>Expected on some tags. Carry on with step 3.</td></tr>
+      <tr><td>Backup fails or the file is empty</td><td>Usually poor contact on DD or DC, which can look like a locked chip. Rarely, a chip really is locked.</td><td>Re-seat the probes and run step 2 again. If it still fails, carry on with step 3: the erase clears any lock.</td></tr>
       <tr><td>No splash screen after reset</td><td>Wrong image for the revision, or the display cable is disturbed.</td><td>Check the serial's last letter against step 3. Flash the other image if needed. Check the display cable is still seated.</td></tr>
       <tr><td>MAC ends in <code>00000000</code></td><td>The stored serial is corrupt.</td><td><code>chroma-flash</code> patches it. By hand, patch a copy of the image (step 8) and reflash.</td></tr>
     </tbody>

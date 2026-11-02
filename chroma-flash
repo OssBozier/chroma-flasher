@@ -33,7 +33,7 @@ Firmware:
                          or chroma29_8151_full_*.bin for serials ending in C)
       --tag-dir DIR      OpenEPaperLink's binaries/Tag directory
       --backup           read the stock firmware before erasing (the default)
-      --no-backup        skip it; factory tags are read-locked, so it usually only costs time
+      --no-backup        skip it: about 20 seconds quicker, but no way back to stock
 
 Diagnose:
       --diag             check the tag without changing it: contact quality, lock state, which
@@ -453,7 +453,7 @@ diag() {
 	STATE[2]=run; banner "HOLD STILL. CHECKING THE LOCK" 43
 	run_cc --read-xdata DF36:2
 	if grep -q "Unable to communicate" "$OUT"; then STATE[2]=skip; TIMES[2]="no answer"
-	elif grep -q "Target is locked" "$OUT"; then locked=1; STATE[2]=ok; TIMES[2]="locked (factory firmware, or locked by its maker)"
+	elif grep -q "Target is locked" "$OUT"; then locked=1; STATE[2]=ok; TIMES[2]="locked, or bad contact (factory firmware is normally readable: re-seat the probes)"
 	elif grep -q "XDATA" "$OUT"; then STATE[2]=ok; TIMES[2]="unlocked"
 	else STATE[2]=skip; TIMES[2]="couldn't tell: $(tr '\r' '\n' <"$OUT" | grep -v '^\s*$' | tail -1 | sed 's/^ *//')"; fi
 
@@ -592,7 +592,7 @@ done
 TIMES[1]="$(( $(date +%s) - t ))s"
 if (( backed_up )); then STATE[1]=ok
 elif [ -n "$NOBACKUP" ]; then TIMES[1]="skipped (--no-backup)"
-else STATE[1]=skip; TIMES[1]+="  (no backup: locked or no contact)"; fi
+else STATE[1]=skip; TIMES[1]+="  (no backup: bad contact, or a locked chip)"; fi
 
 # 3. Erase, write, verify (retries after a lost contact)
 flash_image() {

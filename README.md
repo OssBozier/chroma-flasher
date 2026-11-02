@@ -10,7 +10,8 @@ what is happening, so your eyes and hands can stay on the tag:
 0. **Reads the tag's serial from its label** with the computer's camera (barcode, or OCR of the
    printed serial), or you type it. You get 10 seconds to press `n` if the read is wrong.
 1. **Waits for the chip.** No need to press the debugger's Reset button (see the cc-tool patch below).
-2. **Backs up the stock firmware** if the chip allows it (factory tags are usually read-locked).
+2. **Backs up the stock firmware** so the tag can go back to stock. Factory firmware is normally
+   readable; a "locked" answer is usually a probe that isn't fully on its pad.
 3. **Erases, writes and verifies**, retrying up to 8 times if a probe slips.
 4. **Restarts the tag.**
 5. **Reads the tag's MAC address back from RAM and checks the serial**:
@@ -153,7 +154,7 @@ The camera frames are processed in memory and never saved.
 ```sh
 chroma-flash                      # read the label, then flash and check
 chroma-flash JA10012345B          # serial known: skip the label
-chroma-flash --no-backup          # skip the backup (quicker; factory tags are read-locked anyway)
+chroma-flash --no-backup          # skip the backup (about 20 seconds quicker, but no way back to stock)
 chroma-flash --no-camera          # type the serial instead
 chroma-flash --no-scan            # no label: the serial is only asked for if the tag turns out to have none
 chroma-flash --no-check           # don't read the MAC afterwards
